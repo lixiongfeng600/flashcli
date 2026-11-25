@@ -1,3 +1,56 @@
+//! flashcli-desktop: the egui/eframe desktop client for a local `flashserver`.
+//!
+//! The client contains no model logic. It is a thin UI over the flashserver
+//! HTTP/WebSocket API (`docs/openapi.yaml`), plus a few client-OS duties the
+//! daemon cannot do itself (start/stop the WSL distro and service, edit
+//! `.wslconfig`, run application installers on Windows/macOS).
+//!
+//! # Architecture
+//!
+//! ```text
+//!   main() ──> eframe::run_native ──> App::new (fonts, theme, settings, WS thread)
+//!                                         │
+//!         ┌───────────────────────────────┴──────────── every frame ─┐
+//!         │ App::update                                               │
+//!         │   1. drain_events      apply all queued `Event`s to state │
+//!         │   2. poll_*            periodic health / app / log polls  │
+//!         │   3. draw              side nav · status bar · page · dialogs
+//!         └───────────────────────────────────────────────────────────┘
+//!                ▲ Event (mpsc channel)            │ spawn_*(tx, ctx, ..)
+//!                │                                 ▼
+//!   background threads: start_ws (WebSocket push), spawn_* (one-shot HTTP
+//!   request or local command), follow_app_job (job poller)
+//! ```
+//!
+//! * The UI thread never blocks: every network call or subprocess runs on a
+//!   short-lived `std::thread`, which reports back through `Sender<Event>` and
+//!   calls `ctx.request_repaint()` so the next frame picks the result up.
+//! * `start_ws` keeps one long-lived WebSocket to `/v1/ws` for pushed
+//!   telemetry (`system`, `models`, `storage`, `mirror`, `logs`, `job`).
+//!   Reconnect failures turn into `Event::ServiceDown`; `spawn_health`
+//!   (every 5 s) is the second liveness signal.
+//! * Destructive actions go through a confirmation `DialogState` whose
+//!   `Pending` value is executed by `show_dialog` on confirm.
+//!
+//! # Pages (`Tab`)
+//!
+//! * 应用 (Apps): FlashHub application catalog; install / start / stop /
+//!   uninstall apps. App jobs are followed over HTTP (`follow_app_job`).
+//! * 模型 (Models): local model cache (load/unload/pull/clean/test/options)
+//!   and the FlashHub model catalog (download).
+//! * 状态 (Overview): GPU/CPU charts, service info, storage usage.
+//! * 日志 (Logs): service log (live via WebSocket) or one model's serve log.
+//! * 设置 (Settings): service start/stop, autostart, WSL resources/network,
+//!   download mirror, theme, quit.
+//!
+//! # Local files
+//!
+//! * `state_dir()/settings.json` — theme + WSL UI preferences (`Settings`).
+//! * `state_dir()/api-url.txt`   — flashserver URL chosen by the installer.
+//! * `state_dir()/distro.txt`    — WSL distro name chosen by the installer.
+//! * `%USERPROFILE%/.wslconfig`  — `[wsl2]` keys managed by the Settings page.
+
+// Release builds on Windows use the GUI subsystem so no console window opens.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, HashSet};
@@ -11,8 +64,10 @@ use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// flashserver base URL, resolved once by `api_base()`.
 static API_BASE: OnceLock<String> = OnceLock::new();
 
+/// Per-user client state directory name (under `%LOCALAPPDATA%` or `~/.config`).
 const STATE_DIR_NAME: &str = "flashcli-desktop";
 const LEGACY_STATE_DIR_NAME: &str = "FlashServer";
 
@@ -33,8 +88,11 @@ fn state_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join(STATE_DIR_NAME))
 }
 
-/// The setup engine picks a free Windows port when the default 8790 is in a
-/// Hyper-V/WinNAT excluded range and records it here.
+/// Base URL of the flashserver API (no trailing slash).
+///
+/// Read once from `state_dir()/api-url.txt`, falling back to
+/// `http://127.0.0.1:8790`. The setup engine picks a free Windows port when
+/// the default 8790 is in a Hyper-V/WinNAT excluded range and records it there.
 fn api_base() -> &'static str {
     API_BASE.get_or_init(|| {
         if let Some(path) = state_dir().map(|dir| dir.join("api-url.txt")) {
@@ -49,12 +107,14 @@ fn api_base() -> &'static str {
     })
 }
 
+/// `api_base()` without the scheme (`host:port`), for display.
 fn api_addr() -> &'static str {
     api_base()
         .trim_start_matches("http://")
         .trim_start_matches("https://")
 }
 
+/// Top-level page selected in the left navigation bar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Overview,
@@ -76,30 +136,41 @@ impl Tab {
     }
 }
 
+/// Sub-tab of the Models page.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModelTab {
+    /// Models already cached on this machine (`/v1/models`).
     Local,
+    /// The FlashHub model catalog (`/v1/catalog`).
     Hub,
 }
 
+/// One cached model, built by `parse_models` from `/v1/models` joined with the
+/// `loaded` list of `/v1/system`.
 #[derive(Clone)]
 struct ModelRow {
+    /// Bundle ref (`flashcli-bundle/<name>:<version>` or a local path).
     name: String,
     bundle_ready: bool,
     weights_ready: bool,
+    /// The bundle supports `serve` (otherwise it is run-only).
     serve: bool,
     bundle_bytes: f64,
     runtime_id: String,
     runtime_bytes: f64,
     weights_bytes: f64,
+    /// `source/repo@revision`; equal keys share one weights directory.
     weights_key: String,
+    /// Currently served by the daemon; the fields below are set only then.
     loaded: bool,
     endpoint: String,
     pid: i64,
     loaded_at: String,
+    /// Declared serve protocols (e.g. `openai.chat`); None = not declared.
     capabilities: Option<Vec<String>>,
 }
 
+/// Models that do not declare capabilities are assumed to speak OpenAI chat.
 fn capabilities_allow_chat(caps: Option<&[String]>) -> bool {
     caps.map_or(true, |items| items.iter().any(|c| c == "openai.chat"))
 }
@@ -109,6 +180,7 @@ impl ModelRow {
         capabilities_allow_chat(self.capabilities.as_deref())
     }
 
+    /// True only when the capability is explicitly declared.
     fn has_capability(&self, name: &str) -> bool {
         self.capabilities
             .as_ref()
@@ -119,6 +191,8 @@ impl ModelRow {
         self.bundle_bytes + self.runtime_bytes + self.weights_bytes
     }
 
+    /// Status label: running > ready (serve or run-only) > missing weights >
+    /// missing bundle.
     fn status(&self) -> &'static str {
         if self.loaded {
             "已启动"
@@ -187,6 +261,7 @@ fn unique_model_bytes(models: &[ModelRow]) -> f64 {
     total
 }
 
+/// One FlashHub model repository in the catalog list (`parse_catalog`).
 #[derive(Clone)]
 struct HubRepo {
     id: i64,
@@ -198,59 +273,83 @@ struct HubRepo {
     downloads: i64,
 }
 
+/// One published version of a FlashHub repo.
 #[derive(Clone)]
 struct HubVersion {
     version: String,
     size: f64,
     files: i64,
+    /// Localized release status (正式 / 预发布 / raw value).
     status: String,
 }
 
+/// Version list of the selected FlashHub repo (`/v1/catalog/{id}`).
 #[derive(Clone)]
 struct HubDetail {
     repo_id: i64,
     versions: Vec<HubVersion>,
 }
 
+/// Client preferences persisted to `state_dir()/settings.json`.
 #[derive(Default, Serialize, Deserialize)]
 struct Settings {
     dark: bool,
+    /// Inbound TCP ports opened in the Windows firewall for mirrored WSL
+    /// networking (`80,8000-8010`); empty = any.
     #[serde(default)]
     wsl_ports: String,
+    /// Also `wsl --terminate` the distro when stopping the service.
     #[serde(default)]
     stop_wsl: bool,
 }
 
+/// One bundle-declared serve option, edited in the options dialog.
 #[derive(Clone)]
 struct ServeOption {
     name: String,
+    /// CLI flag passed to the bundle (e.g. `--max-model-len`).
     flag: String,
+    /// Value type from the bundle (`string`, `int`, `bool`, ...).
     kind: String,
     default: String,
+    /// User override; empty = use the default.
     value: String,
     help: String,
 }
 
+/// State of the per-model "startup options" dialog
+/// (`GET`/`PUT /v1/models/options`).
 #[derive(Clone)]
 struct OptionsDialog {
     reference: String,
     host: String,
     default_host: String,
     public_host: String,
+    /// Text field; "0" = pick a free port.
     port: String,
     options: Vec<ServeOption>,
+    /// Waiting for the GET response.
     loading: bool,
+    /// Waiting for the PUT response.
     saving: bool,
     error: String,
+    /// The model is running; saved options apply after a restart.
     restart_required: bool,
+    /// Start the model once the options are saved (the "save and start" path).
     start_after_save: bool,
 }
 
+/// The `[wsl2]` keys of `%USERPROFILE%/.wslconfig` managed by the Settings
+/// page. Empty strings mean "not set" (WSL default).
 #[derive(Clone)]
 struct WslConfig {
+    /// `memory=` (e.g. `32GB`).
     memory: String,
+    /// `processors=` (CPU count).
     processors: String,
+    /// `swap=` (e.g. `8GB`).
     swap: String,
+    /// `networkingMode=mirrored` (LAN-reachable) instead of the NAT default.
     mirrored: bool,
     /// `autoMemoryReclaim=gradual` (on by default): WSL returns idle page
     /// cache to Windows instead of holding it for the whole session.
@@ -269,76 +368,128 @@ impl Default for WslConfig {
     }
 }
 
+/// Message from a background thread to the UI thread.
+///
+/// Every worker owns a `Sender<Event>`; `App::drain_events` consumes them at
+/// the start of each frame and is the only place these results touch `App`.
 enum Event {
+    /// `/v1/system` snapshot (GPU/CPU telemetry, uptime, loaded models,
+    /// autostart). Pushed over WebSocket or fetched after an action.
     System(Value),
-    ServiceDown,
+    /// The WebSocket could not reconnect: mark the service and models stopped.
+    Servic00000000000000000000000000eDown,
+    /// `/v1/models` (local model cache).
     Models(Value),
+    /// `/v1/storage` (disk usage per area).
     Storage(Value),
+    /// `/v1/mirror` (download mirror on/off).
     Mirror(Value),
+    /// Initial/polled log text (None = request failed; keep the old text).
     Logs(Option<String>),
+    /// New service-log lines pushed over WebSocket.
     LogLines(Vec<String>),
+    /// Result line of a log export.
     LogsNote(String),
+    /// Result line of a model clean.
     CleanNote(String),
+    /// Result line of a shared-cache clean.
     StorageNote(String),
+    /// A blocking operation started: show the busy overlay with this label.
     OpBusy(String),
+    /// The blocking operation finished: hide the overlay and toast the result.
     OpDone(Result<String, String>),
+    /// Autostart state confirmed by a successful enable/disable.
     Autostart(bool),
+    /// One-shot status line under the model loading progress.
     Status(String),
+    /// Progress of a pull/load/smoke job (WebSocket or local submission).
     Job(JobEvent),
+    /// Final result of a smoke test request.
     Smoke(Result<Value, String>),
+    /// Job id of a submitted smoke test (used for cancel).
     SmokeJob(String),
+    /// FlashHub model catalog search result.
     Catalog { repos: Vec<HubRepo>, total: i64 },
+    /// FlashHub catalog tag filter list: (id, name).
     CatalogTags(Vec<(i64, String)>),
     HubDetail(HubDetail),
     HubError(String),
+    /// App list response tagged with its request id (see `App::apps_req`).
     Apps(Vec<Value>, u64),
     AppsError(String, u64),
+    /// Downloaded cover bytes for a URL (None = download failed).
     AppCover(String, Option<Vec<u8>>),
+    /// `/v1/apps/{org}/{name}` detail: FlashHub manifest + `local` state.
     AppDetail(Value),
     AppDetailError(String),
     /// Fresh local state for one app (None = not installed). Lets 启动/停止/卸载
     /// update the UI immediately without waiting for the FlashHub manifest.
     AppLocal { key: String, state: Option<Value> },
+    /// An app action finished (verb, toast text or error); triggers a refresh.
     AppAction(String, Result<String, String>),
+    /// One progress line of an app install/start/stop job (`line` may be empty
+    /// when only `running` changes).
     AppJob { verb: String, reference: String, line: String, running: bool },
+    /// Serve-log tail of a daemon-started app model.
     AppModelLog { key: String, lines: Vec<String> },
+    /// Loaded serve options for the options dialog.
     ModelOptions { reference: String, result: Result<Value, String> },
+    /// Saved serve options; `start` = start the model afterwards.
     ModelOptionsSaved { reference: String, result: Result<Value, String>, start: bool },
+    /// `.wslconfig` applied (and WSL restarted).
     WslApplied(Result<String, String>),
+    /// `/health` probe result (every 5 s).
     Health(bool),
 }
 
+/// Progress update for the model pull/load progress bar or the smoke dialog.
 struct JobEvent {
+    /// Daemon phase (`prepare`, `weights`, `venv`, `done`, ...); see
+    /// `translate_phase`.
     phase: String,
     message: String,
+    /// `running` / `done` / `failed`.
     state: String,
+    /// Localized action name shown to the user (下载 / 加载 / 启动 / ...).
     verb: String,
     reference: String,
+    /// Daemon job type (`pull`, `load`, `smoke`, ...).
     kind: String,
+    /// Produced by this client (submission/failure) rather than the WebSocket;
+    /// its `verb` always wins.
     authoritative: bool,
 }
 
+/// Action executed by `show_dialog` once the user confirms.
 enum Pending {
     StopService,
     DisableAutostart,
+    /// Stop (unload) a served model by ref.
     Unload(String),
+    /// Delete the cached files of these model refs.
     Clean(Vec<String>),
+    /// Run a smoke test for this model ref.
     Smoke(String),
+    /// Write `App::wsl_pending` to `.wslconfig` and restart WSL.
     ApplyWsl,
+    /// Close the window.
     Quit,
 }
 
+/// Generic confirmation dialog (title, message, action on confirm).
 struct DialogState {
     title: String,
     message: String,
     action: Pending,
 }
 
+/// Smoke-test dialog state (run test or serve request test).
 struct SmokeState {
     title: String,
     running: bool,
     ok: bool,
     cancelled: bool,
+    /// Daemon job id; empty until `Event::SmokeJob` arrives.
     job_id: String,
     log: String,
 }
@@ -470,17 +621,31 @@ enum AppCover {
     Failed,
 }
 
+/// All UI state. Owned by the UI thread; background threads only reach it
+/// through `Event`s.
 pub struct App {
+    // --- event plumbing ---
     rx: Receiver<Event>,
+    /// Cloned into every background worker.
     tx: Sender<Event>,
+
+    // --- navigation / theme ---
     tab: Tab,
     model_tab: ModelTab,
     dark: bool,
+
+    // --- service telemetry / local models ---
+    /// Latest `/v1/system`; None = service not reachable.
     system: Option<Value>,
     models: Vec<ModelRow>,
+    /// Model shown in the detail window.
     model_detail: Option<ModelRow>,
+    /// Model shown in the "how to call it" dialog.
     use_model: Option<ModelRow>,
+
+    // --- FlashHub model catalog ---
     hub_query: String,
+    /// Selected tag filter (0 = all).
     hub_tag: i64,
     hub_tags: Vec<(i64, String)>,
     hub_repos: Vec<HubRepo>,
@@ -490,11 +655,15 @@ pub struct App {
     hub_busy: bool,
     hub_searched: bool,
     hub_error: String,
+
+    // --- applications page ---
+    /// Raw `/v1/apps` rows (local `installed`/`state` merged in).
     apps: Vec<Value>,
     apps_loading: bool,
     apps_loaded: bool,
     apps_error: String,
     apps_search: String,
+    /// Selected domain chip (empty = all).
     apps_domain: String,
     apps_domains: Vec<String>,
     /// Bumped for every list request; stale responses are dropped.
@@ -502,8 +671,11 @@ pub struct App {
     /// App key -> display name, so the install banner keeps the name even when
     /// the current filter excludes that app.
     app_names: HashMap<String, String>,
+    /// Index into `apps` of the highlighted card.
     apps_selected: Option<usize>,
+    /// Detail of the selected app (manifest + `local` state).
     app_detail: Option<Value>,
+    /// Open install / start-setup / uninstall confirmation dialogs.
     app_install: Option<AppInstallPrompt>,
     app_setup: Option<AppSetupPrompt>,
     app_uninstall: Option<AppUninstallPrompt>,
@@ -512,57 +684,100 @@ pub struct App {
     /// Recent serve-log lines for apps started by the daemon (restore), keyed
     /// by app ref. Desktop-initiated jobs already stream their own log.
     app_model_logs: HashMap<String, Vec<String>>,
+    /// Throttles for `poll_transitional_app` (detail: 0.9 s, list: 5 s).
     last_app_poll: Instant,
     last_apps_poll: Instant,
     /// Full install log shown in a dialog: (title, text).
     app_log_dialog: Option<(String, String)>,
+    /// Cover textures keyed by URL.
     app_covers: HashMap<String, AppCover>,
+
+    // --- storage / mirror ---
+    /// (label, formatted size) per storage area.
     storage: Vec<(String, String)>,
     storage_total: f64,
+    /// Raw area name -> bytes (for the cache-clean dialog).
     storage_sizes: HashMap<String, f64>,
     storage_note: String,
     mirror_enabled: Option<bool>,
     cache_dialog: bool,
     cache_selected: HashSet<String>,
+
+    // --- logs page ---
     logs: String,
+    /// A log request is in flight.
     logs_busy: bool,
+    /// Time of the last log response (None = never loaded).
     logs_at: Option<Instant>,
     logs_since: Option<u64>,
+    /// Model whose serve log is shown; None = the service log.
     logs_ref: Option<String>,
     logs_note: String,
+
+    // --- service operations ---
+    /// Autostart state learned from the last enable/disable (fallback when
+    /// `/v1/system` is unavailable).
     autostart_known: Option<bool>,
+    /// Label of the blocking operation (busy overlay); None = idle.
     op_busy: Option<String>,
+    /// Toast: (text, success, shown at).
     op_note: Option<(String, bool, Instant)>,
+
+    // --- local model list ---
+    /// Models ticked for "clean"; new unloaded models are ticked by default.
     selected_models: HashSet<String>,
+    /// Model names seen in the previous list (to detect new ones).
     known_models: HashSet<String>,
     models_note: String,
+    /// Ref typed into the "load" input.
     load_ref: String,
+
+    // --- model pull/load progress bar ---
+    /// Final status line (completed/failed) and when it was set.
     load_status: String,
     load_status_at: Option<Instant>,
+    /// A pull/load job is running.
     loading: bool,
     load_phase: String,
     load_message: String,
     load_pct: Option<f32>,
+    /// Ref and verb of the job the progress bar describes.
     job_ref: String,
     job_verb: String,
+
+    // --- dialogs ---
     dialog: Option<DialogState>,
     options_dialog: Option<OptionsDialog>,
+
+    // --- WSL settings ---
+    /// Values edited in the Settings page (loaded from `.wslconfig`).
     wsl: WslConfig,
     wsl_ports: String,
     stop_wsl: bool,
+    /// Config/ports waiting for the "restart WSL" confirmation.
     wsl_pending: Option<WslConfig>,
     wsl_pending_ports: String,
+
+    // --- smoke test ---
     smoke: Option<SmokeState>,
+    /// Cancel requested before the job id was known; sent on `SmokeJob`.
     pending_smoke_cancel: bool,
+    /// The window close was requested (running smoke job already cancelled).
     closing: bool,
+
+    // --- charts (x = service uptime seconds, y = percent) ---
     gpu_util: Vec<[f64; 2]>,
     gpu_mem: Vec<[f64; 2]>,
     cpu: Vec<[f64; 2]>,
+    /// Uptime of the last plotted sample.
     x: f64,
+    /// Last `/health` probe.
     health_at: Instant,
 }
 
 impl App {
+    /// One-time setup: fonts, theme and saved settings, the event channel, the
+    /// WebSocket listener thread and the current `.wslconfig`.
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
         let settings = load_settings();
@@ -572,6 +787,7 @@ impl App {
         apply_theme(&cc.egui_ctx, dark);
 
         let (tx, rx) = channel();
+        // Long-lived WebSocket listener; it pushes telemetry/job events.
         start_ws(tx.clone(), cc.egui_ctx.clone());
         let wsl = load_wslconfig();
 
@@ -661,10 +877,15 @@ impl App {
         }
     }
 
+    /// Apply every queued background result to the UI state (non-blocking).
+    /// Called first in each frame, so all state mutation from workers happens
+    /// here, on the UI thread.
     fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 Event::System(v) => {
+                    // Telemetry: remember autostart, append one chart sample
+                    // at most every 0.5 s of service uptime.
                     self.autostart_known = match v["autostart"].as_str() {
                         Some("enabled") => Some(true),
                         Some("disabled") => Some(false),
@@ -700,6 +921,7 @@ impl App {
                     self.sync_model_selection();
                 }
                 Event::ServiceDown => {
+                    // No service: nothing can be loaded any more.
                     self.system = None;
                     for model in &mut self.models {
                         model.loaded = false;
@@ -768,6 +990,8 @@ impl App {
                 }
                 Event::Job(job) => self.apply_job(job),
                 Event::ModelOptions { reference, result } => {
+                    // Fill the options dialog, unless it was closed or
+                    // switched to another model meanwhile.
                     if let Some(dlg) = self.options_dialog.as_mut() {
                         if dlg.reference == reference {
                             match result {
@@ -809,6 +1033,8 @@ impl App {
                     }
                 }
                 Event::ModelOptionsSaved { reference, result, start } => {
+                    // Close the dialog on success, toast the outcome and, for
+                    // "save and start", submit the load job.
                     let mut close = false;
                     let mut note: Option<(String, bool, Instant)> = None;
                     let mut start_ref: Option<String> = None;
@@ -863,6 +1089,9 @@ impl App {
                     });
                 }
                 Event::Health(up) => {
+                    // Down: same reset as ServiceDown. Up while we think it is
+                    // down: fetch system + models right away instead of
+                    // waiting for the next WebSocket push.
                     if !up {
                         if self.system.is_some() {
                             self.system = None;
@@ -923,6 +1152,8 @@ impl App {
                     });
                 }
                 Event::SmokeJob(id) => {
+                    // Remember the job id; send a cancel queued before it
+                    // was known.
                     if let Some(smoke) = self.smoke.as_mut() {
                         smoke.job_id = id.clone();
                     }
@@ -1046,6 +1277,9 @@ impl App {
         }
     }
 
+    /// Start a pull (`pull = true`, `/v1/pull`) or load (`/v1/models/load`)
+    /// job for `ref_str` and reset the progress bar. `verb` is the label shown
+    /// to the user; progress then arrives as `Event::Job` over WebSocket.
     fn spawn_job_ui(
         &mut self,
         ctx: &egui::Context,
@@ -1063,6 +1297,7 @@ impl App {
         spawn_job(self.tx.clone(), ctx.clone(), ref_str, pull, verb);
     }
 
+    /// Open the smoke dialog in the running state and submit the test job.
     fn start_smoke(&mut self, ctx: &egui::Context, name: String) {
         self.pending_smoke_cancel = false;
         self.smoke = Some(SmokeState {
@@ -1076,6 +1311,9 @@ impl App {
         spawn_smoke(self.tx.clone(), ctx.clone(), name);
     }
 
+    /// Route a job update: `smoke` jobs append to the smoke dialog (ignored if
+    /// it was closed); everything else drives the model progress bar
+    /// (`loading`, `load_phase`, `load_pct`, final `load_status`).
     fn apply_job(&mut self, job: JobEvent) {
         if job.kind == "smoke" {
             if self.smoke.is_none() {
@@ -1325,6 +1563,8 @@ impl App {
         );
     }
 
+    /// Keep the clean selection consistent with a new model list: drop refs
+    /// that vanished or are now loaded, and tick newly appeared unloaded models.
     fn sync_model_selection(&mut self) {
         let cleanable: HashSet<String> = self
             .models
@@ -1341,6 +1581,7 @@ impl App {
         self.known_models = self.models.iter().map(|m| m.name.clone()).collect();
     }
 
+    /// Autostart from the live `/v1/system`, else the last known value.
     fn autostart_state(&self) -> Option<bool> {
         self.system
             .as_ref()
@@ -1352,6 +1593,9 @@ impl App {
             .or(self.autostart_known)
     }
 
+    // ===================== pages =====================
+
+    /// 状态 page: GPU/CPU cards with history charts, service info, storage.
     fn overview(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1386,6 +1630,7 @@ impl App {
             });
     }
 
+    /// GPU card: name, utilization/VRAM gauges and their history plots.
     fn gpu_card(&self, ui: &mut egui::Ui) {
         panel(ui, "显卡", |ui| {
             let Some(sys) = &self.system else {
@@ -1476,6 +1721,7 @@ impl App {
         });
     }
 
+    /// CPU / RAM card with the CPU history plot.
     fn cpu_card(&self, ui: &mut egui::Ui) {
         panel(ui, "处理器", |ui| {
             let Some(sys) = &self.system else {
@@ -1552,6 +1798,7 @@ impl App {
         });
     }
 
+    /// Service facts (listen address, version, running models, autostart).
     fn service_panel(&self, ui: &mut egui::Ui) {
         panel(ui, "服务状态", |ui| {
             let Some(sys) = &self.system else {
@@ -1595,6 +1842,7 @@ impl App {
         });
     }
 
+    /// Disk usage per storage area (`/v1/storage`).
     fn storage_panel(&self, ui: &mut egui::Ui) {
         let title = format!("磁盘占用 · 总 {}", fmt_bytes(self.storage_total));
         panel(ui, &title, |ui| {
@@ -1616,6 +1864,8 @@ impl App {
         });
     }
 
+    /// 模型 page: switches between the local cache (`local_models`) and the
+    /// FlashHub catalog (`hub_models`); loads catalog tags on first use.
     fn models_page(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
@@ -1651,6 +1901,8 @@ impl App {
         self.show_model_detail(ui.ctx());
     }
 
+    /// Progress card of the current pull/load job (verb, ref, phase, percent,
+    /// last message). After completion the final status stays visible briefly.
     fn load_progress(&self, ui: &mut egui::Ui) {
         let stale = self
             .load_status_at
@@ -1750,6 +2002,9 @@ impl App {
     }
 
 
+    /// 应用 page: search box + domain chips, the app card grid, a status
+    /// banner for running app jobs, and the detail pane of the selected app.
+    /// Clicking a card fetches its detail (`spawn_app_detail`).
     fn apps_page(&mut self, ui: &mut egui::Ui) {
         if !self.apps_loaded && !self.apps_loading {
             self.reload_apps(ui.ctx());
@@ -1943,6 +2198,14 @@ impl App {
         }
     }
 
+    /// Detail pane of one app: header with action buttons, platform support,
+    /// run status (endpoint, models, job log), install commands, dependent
+    /// model bundles.
+    ///
+    /// Button clicks are collected during drawing and applied at the end:
+    /// install/uninstall open their confirmation dialogs; start opens the setup
+    /// script dialog when the manifest declares scripts, otherwise start/stop
+    /// set an optimistic state and call `spawn_app_action` directly.
     fn render_app_detail(&mut self, ui: &mut egui::Ui, detail: &Value) {
         let manifest = &detail["manifest"];
         let row = self
@@ -2504,6 +2767,9 @@ impl App {
         }
     }
 
+    /// Local models tab: "load by ref" input, progress card, and the cached
+    /// model table. Row actions: detail, logs, use, test, start/stop,
+    /// re-sync, clean (destructive ones go through `DialogState`).
     fn local_models(&mut self, ui: &mut egui::Ui) {
         let total_bytes = unique_model_bytes(&self.models);
         let ready = self.models.iter().filter(|m| m.ready()).count();
@@ -2819,6 +3085,8 @@ impl App {
         }
     }
 
+    /// FlashHub tab: search + tag filter, repo list, version list of the
+    /// selected repo; "download" submits a pull job.
     fn hub_models(&mut self, ui: &mut egui::Ui) {
         let mut run_search = false;
         ui.horizontal(|ui| {
@@ -3045,6 +3313,7 @@ impl App {
         }
     }
 
+    /// Search the FlashHub catalog with the current query/tag.
     fn load_hub(&mut self, ctx: &egui::Context) {
         self.hub_busy = true;
         self.hub_searched = true;
@@ -3063,6 +3332,7 @@ impl App {
         }
     }
 
+    /// Select a FlashHub repo and fetch its versions.
     fn select_hub(&mut self, id: i64, ctx: &egui::Context) {
         self.hub_selected = Some(id);
         self.hub_detail = None;
@@ -3070,6 +3340,11 @@ impl App {
         spawn_hub_detail(self.tx.clone(), ctx.clone(), id);
     }
 
+    // ===================== dialogs =====================
+    // Each `show_*` runs every frame and returns early when its state is None.
+
+    /// Model detail window (`model_detail`): cache parts, runtime, weights,
+    /// endpoint; can open startup options or load the model.
     fn show_model_detail(&mut self, ctx: &egui::Context) {
         let Some(model) = self.model_detail.clone() else {
             return;
@@ -3264,6 +3539,8 @@ impl App {
         }
     }
 
+    /// Startup options dialog (`options_dialog`): host, port and the
+    /// bundle-declared serve options; "save" PUTs them (optionally then starts).
     fn show_options_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dlg) = self.options_dialog.take() else {
             return;
@@ -3494,6 +3771,7 @@ impl App {
         self.options_dialog = Some(dlg);
     }
 
+    /// Open the options dialog in the loading state and fetch the options.
     fn open_model_options(&mut self, ctx: &egui::Context, reference: String, start_after_save: bool) {
         self.options_dialog = Some(OptionsDialog {
             reference: reference.clone(),
@@ -3511,6 +3789,8 @@ impl App {
         spawn_model_options(self.tx.clone(), ctx.clone(), reference);
     }
 
+    /// "使用模型" dialog (`use_model`): endpoint and copyable request examples
+    /// for a running model, plus a request test (smoke job).
     fn show_use_dialog(&mut self, ctx: &egui::Context) {
         let Some(model) = self.use_model.clone() else {
             return;
@@ -3683,6 +3963,8 @@ impl App {
         }
     }
 
+    /// 日志 page: service log (one load, then WebSocket lines) or a model's
+    /// serve log (polled every second by `update`); export to a file.
     fn logs_page(&mut self, ui: &mut egui::Ui) {
         let mut clear = false;
         let mut reset = false;
@@ -3783,6 +4065,9 @@ impl App {
             });
     }
 
+    /// 设置 page: service start/stop and autostart, WSL resources/network
+    /// (`.wslconfig`), firewall ports, download mirror, theme, cache cleanup,
+    /// quit.
     fn settings_page(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -4087,6 +4372,7 @@ impl App {
             });
     }
 
+    /// Switch theme and persist it to `settings.json` (also Ctrl/Cmd+T).
     fn set_theme(&mut self, ctx: &egui::Context, dark: bool) {
         if self.dark != dark {
             self.dark = dark;
@@ -4099,6 +4385,7 @@ impl App {
         }
     }
 
+    /// Shared-cache cleanup dialog: pick storage areas and clean them.
     fn show_cache_dialog(&mut self, ctx: &egui::Context) {
         if !self.cache_dialog || self.dialog.is_some() || self.model_detail.is_some() {
             return;
@@ -4211,6 +4498,7 @@ impl App {
         }
     }
 
+    /// Modal spinner while `op_busy` is set (service start/stop, WSL apply...).
     fn show_busy_overlay(&self, ctx: &egui::Context) {
         let Some(label) = &self.op_busy else {
             return;
@@ -4234,6 +4522,7 @@ impl App {
             });
     }
 
+    /// Success/error toast from `op_note`, hidden after 4 s.
     fn show_toast(&self, ctx: &egui::Context) {
         let Some((message, ok, at)) = &self.op_note else {
             return;
@@ -4279,6 +4568,7 @@ impl App {
             });
     }
 
+    /// Smoke-test dialog: live log, result, cancel (cancels the daemon job).
     fn show_smoke_dialog(&mut self, ctx: &egui::Context) {
         let Some(smoke) = self.smoke.as_mut() else {
             return;
@@ -4407,6 +4697,8 @@ impl App {
 
     /// Confirm an application install. A shell install command only runs when
     /// the user explicitly picks "运行脚本并安装"; the daemon never decides.
+    /// Start confirmation for apps with setup scripts: the user ticks which
+    /// scripts may run, then the app is started with that list.
     fn show_app_setup_dialog(&mut self, ctx: &egui::Context) {
         let Some(prompt) = self.app_setup.clone() else {
             return;
@@ -4553,6 +4845,10 @@ impl App {
         }
     }
 
+    /// Install confirmation: shows the models to prepare and the platform
+    /// install command, and turns the user's choice into an
+    /// `AppInstallAction` (skip / run script / download installer) for
+    /// `spawn_app_install`.
     fn show_app_install_dialog(&mut self, ctx: &egui::Context) {
         let Some(prompt) = self.app_install.clone() else {
             return;
@@ -4780,6 +5076,7 @@ impl App {
     }
 
     /// Confirm removing an application (models stop first; caches are optional).
+    /// Uninstall confirmation, optionally also purging the app's models.
     fn show_app_uninstall_dialog(&mut self, ctx: &egui::Context) {
         let Some(prompt) = self.app_uninstall.clone() else {
             return;
@@ -4877,6 +5174,7 @@ impl App {
     }
 
     /// Full install/prepare log for one application.
+    /// Full app job log viewer (`app_log_dialog`).
     fn show_app_log_dialog(&mut self, ctx: &egui::Context) {
         let Some((title, log)) = self.app_log_dialog.clone() else {
             return;
@@ -4944,6 +5242,8 @@ impl App {
         }
     }
 
+    /// Generic confirmation dialog; on confirm executes `dialog.action`
+    /// (`Pending`) by spawning the matching worker.
     fn show_dialog(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.dialog.as_ref() else {
             return;
@@ -5058,14 +5358,25 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// One frame. Order matters:
+    /// 1. apply background results (`drain_events`) and periodic polls
+    ///    (app state, 5 s `/health`, logs);
+    /// 2. handle window close (cancel a running smoke job) and Ctrl/Cmd+T;
+    /// 3. draw the left nav, bottom status bar and the current page;
+    /// 4. draw dialogs/overlays last so they sit on top.
+    /// A repaint is scheduled every 500 ms (100 ms while busy) so telemetry
+    /// keeps moving without user input.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
         self.poll_transitional_app(ctx);
+        // Second liveness signal besides the WebSocket.
         if self.health_at.elapsed() >= Duration::from_secs(5) {
             self.health_at = Instant::now();
             spawn_health(self.tx.clone(), ctx.clone());
         }
         if !self.closing && ctx.input(|i| i.viewport().close_requested()) {
+            // Closing the window must not leave a smoke test running in the
+            // daemon; cancel it synchronously (2 s budget).
             self.closing = true;
             if let Some(smoke) = &self.smoke {
                 if smoke.running && !smoke.job_id.is_empty() {
@@ -5104,6 +5415,8 @@ impl eframe::App for App {
         }
         let dark = ctx.style().visuals.dark_mode;
 
+        // Left navigation: page buttons, then version / uptime / service state
+        // at the bottom. Entering Logs or Apps triggers their first load.
         egui::SidePanel::left("nav")
             .resizable(false)
             .exact_width(200.0)
@@ -5160,6 +5473,7 @@ impl eframe::App for App {
                 });
             });
 
+        // Bottom status bar: GPU / VRAM / CPU / RAM usage.
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::NONE
@@ -5204,6 +5518,7 @@ impl eframe::App for App {
                 });
             });
 
+        // Central page.
         let frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(12));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.add_space(4.0);
@@ -5216,6 +5531,8 @@ impl eframe::App for App {
             }
         });
 
+        // Dialogs and overlays (each is a no-op when closed). The generic
+        // confirmation, busy overlay and toast come last to stay on top.
         self.show_use_dialog(ctx);
         self.show_cache_dialog(ctx);
         self.show_smoke_dialog(ctx);
@@ -5595,6 +5912,8 @@ fn red(ui: &egui::Ui) -> egui::Color32 {
 
 // ---------- data ----------
 
+/// Build the local model table from `/v1/models`, marking models that appear
+/// in the `loaded` list of `/v1/system` as running (with endpoint/pid).
 fn parse_models(v: &Value, system: Option<&Value>) -> Vec<ModelRow> {
     let mut loaded: HashMap<String, (String, i64, String)> = HashMap::new();
     if let Some(items) = system.and_then(|s| s["loaded"].as_array()) {
@@ -5646,6 +5965,7 @@ fn parse_models(v: &Value, system: Option<&Value>) -> Vec<ModelRow> {
         .unwrap_or_default()
 }
 
+/// Parse `/v1/catalog` into repo rows and the total match count.
 fn parse_catalog(v: &Value) -> (Vec<HubRepo>, i64) {
     let total = v["total"].as_i64().unwrap_or(0);
     let repos = v["repos"]
@@ -5675,6 +5995,7 @@ fn parse_catalog(v: &Value) -> (Vec<HubRepo>, i64) {
     (repos, total)
 }
 
+/// Parse `/v1/catalog/{id}` into its version list.
 fn parse_hub_detail(v: &Value) -> HubDetail {
     HubDetail {
         repo_id: v["repo"]["id"].as_i64().unwrap_or(0),
@@ -5702,6 +6023,8 @@ fn parse_hub_detail(v: &Value) -> HubDetail {
     }
 }
 
+/// Parse `/v1/storage`: (localized label, formatted size) rows, total bytes,
+/// and raw area name -> bytes.
 fn parse_storage(v: &Value) -> (Vec<(String, String)>, f64, HashMap<String, f64>) {
     let mut total = 0.0;
     let mut sizes = HashMap::new();
@@ -5735,6 +6058,7 @@ fn storage_label(name: &str) -> &str {
     }
 }
 
+/// Append a chart sample, keeping at most 600 points (~5 min at 0.5 s).
 fn push_point(points: &mut Vec<[f64; 2]>, x: f64, y: f32) {
     points.push([x, y as f64]);
     if points.len() > 600 {
@@ -5743,7 +6067,16 @@ fn push_point(points: &mut Vec<[f64; 2]>, x: f64, y: f32) {
 }
 
 // ---------- threads ----------
+// Background workers. Pattern: `spawn_*(tx, ctx, args)` starts a thread that
+// does the blocking work, sends one or more `Event`s, then calls
+// `ctx.request_repaint()` so the UI wakes up and drains them.
 
+/// Long-lived WebSocket listener for `/v1/ws`.
+///
+/// Translates server messages into `Event`s (`system`, `models`, `storage`,
+/// `mirror`, `logs`, `job`). App jobs (`app-*`) are skipped because
+/// `follow_app_job` polls them. On disconnect it reconnects every 2 s; after
+/// 3 consecutive failed connects it reports `Event::ServiceDown`.
 fn start_ws(tx: Sender<Event>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let mut reconnect_fails = 0;
@@ -5758,6 +6091,7 @@ fn start_ws(tx: Sender<Event>, ctx: egui::Context) {
             match ewebsock::connect(ws_url, ewebsock::Options::default()) {
                 Ok((_sender, receiver)) => {
                     reconnect_fails = 0;
+                    // ewebsock is non-blocking: drain, then sleep 100 ms.
                     loop {
                         let mut closed = false;
                         while let Some(event) = receiver.try_recv() {
@@ -5859,11 +6193,15 @@ fn start_ws(tx: Sender<Event>, ctx: egui::Context) {
     });
 }
 
+/// Service-level operation run by `spawn_action` behind the busy overlay.
 #[derive(Clone, Copy)]
 enum Action {
     Start,
+    /// `stop_wsl`: also terminate the WSL distro.
     Stop { stop_wsl: bool },
     EnableAutostart,
+    /// `keep_stopped`: the service was not running; stop it again after
+    /// disabling so the change does not leave it running.
     DisableAutostart { keep_stopped: bool },
 }
 
@@ -5878,6 +6216,9 @@ impl Action {
     }
 }
 
+/// Run a service `Action` in the background:
+/// `OpBusy` → do the work (Start also waits up to 8 s for `/v1/system`) →
+/// `OpDone` toast → on success refresh system/models/storage.
 fn spawn_action(tx: Sender<Event>, ctx: egui::Context, action: Action) {
     std::thread::spawn(move || {
         let _ = tx.send(Event::OpBusy(action.label().into()));
@@ -5959,6 +6300,9 @@ fn spawn_action(tx: Sender<Event>, ctx: egui::Context, action: Action) {
     });
 }
 
+/// Submit an async pull or load job. Only the submission (and a submission
+/// failure) is reported here; progress comes over the WebSocket. Verb
+/// "重新同步" forces a remote re-verification (`force: true`).
 fn spawn_job(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -6007,7 +6351,9 @@ fn spawn_job(
     });
 }
 
+// ---------- applications: helpers ----------
 
+/// OS key used by app manifests (`darwin` instead of Rust's `macos`).
 fn app_os_key() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
@@ -6015,6 +6361,7 @@ fn app_os_key() -> &'static str {
     }
 }
 
+/// Arch key used by app manifests (`arm64` instead of Rust's `aarch64`).
 fn app_arch_key() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "x86_64",
@@ -6049,6 +6396,7 @@ fn apply_job_event(job: &mut AppJobState, verb: &str, line: &str, running: bool)
     job.running = running;
 }
 
+/// `setup.scripts` of an app manifest (entries without key/url are skipped).
 fn app_setup_scripts(manifest: &Value) -> Vec<AppSetupScript> {
     manifest["setup"]["scripts"]
         .as_array()
@@ -6084,12 +6432,15 @@ fn app_last_log(detail: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Client user's home directory, sent to the daemon so setup scripts can
+/// write client-side config.
 fn client_home() -> String {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_default()
 }
 
+/// Install command (script or URL) for this platform, if declared.
 fn install_command(manifest: &Value) -> Option<String> {
     let key = app_platform_command_key(manifest)?;
     manifest["install"]["commands"][key.as_str()]
@@ -6136,6 +6487,7 @@ fn app_cover_url(app: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Join a JSON string array with ", ".
 fn csv_list(value: &Value) -> String {
     value
         .as_array()
@@ -6363,6 +6715,7 @@ fn app_cover_widget(
     }
 }
 
+/// Detail-pane section header (separator + bold title).
 fn app_section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(10.0);
     ui.separator();
@@ -6370,6 +6723,7 @@ fn app_section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(2.0);
 }
 
+/// "key value" row; skipped when the value is empty.
 fn app_field(ui: &mut egui::Ui, key: &str, value: &str) {
     if value.trim().is_empty() {
         return;
@@ -6380,6 +6734,7 @@ fn app_field(ui: &mut egui::Ui, key: &str, value: &str) {
     });
 }
 
+/// Wrapped small monospace text.
 fn app_mono(ui: &mut egui::Ui, value: &str) {
     ui.add(egui::Label::new(egui::RichText::new(value).monospace().small()).wrap());
 }
@@ -6483,8 +6838,6 @@ fn app_log_tail(log: &str, count: usize) -> Vec<String> {
     all[start..].iter().map(|l| l.to_string()).collect()
 }
 
-/// Install phase for a progress line (keeps the previous phase when the line
-/// carries no step information).
 /// Status line above the app grid: name the application action first, then the
 /// current sub-step (for example "正在启动 Grok CLI 应用 · 模型 xxx 启动中").
 fn app_job_status_text(job: &AppJobState, label: &str, pct: &str) -> String {
@@ -6500,6 +6853,7 @@ fn app_job_status_text(job: &AppJobState, label: &str, pct: &str) -> String {
     )
 }
 
+/// Sub-step text of an app job ("模型 <ref> 启动中", "安装应用", ...).
 fn app_job_subitem(job: &AppJobState) -> String {
     let model = app_job_model(&job.log);
     let model_text = model.map(|m| format!("{m} ")).unwrap_or_default();
@@ -6532,6 +6886,8 @@ fn app_job_model(log: &str) -> Option<String> {
     None
 }
 
+/// Install phase for a progress line, recognized by keywords (keeps the
+/// previous phase when the line carries no step information).
 fn app_job_phase(line: &str, current: &str) -> String {    let lower = line.to_ascii_lowercase();
     if line.starts_with("Application:")
         || lower.contains("install command")
@@ -6552,6 +6908,7 @@ fn app_job_phase(line: &str, current: &str) -> String {    let lower = line.to_a
     }
 }
 
+/// Initial phase of a new app job, by verb.
 fn default_app_job_phase(verb: &str) -> String {
     match verb {
         "准备模型" => "准备模型",
@@ -6562,6 +6919,7 @@ fn default_app_job_phase(verb: &str) -> String {
     .to_string()
 }
 
+/// Localized verb for a transitional app state; None for stable states.
 fn transitional_verb(state: &str) -> Option<&'static str> {
     match state {
         "starting" => Some("启动"),
@@ -6572,6 +6930,8 @@ fn transitional_verb(state: &str) -> Option<&'static str> {
     }
 }
 
+/// Model ref of an app: the first locally recorded model, else the manifest's
+/// default (or first) bundle.
 fn app_model_ref(detail: &Value) -> Option<String> {
     detail["local"]["models"]
         .as_array()
@@ -6596,6 +6956,7 @@ fn app_model_ref(detail: &Value) -> Option<String> {
         })
 }
 
+/// (org, name, version) of an app detail response.
 fn app_identity(detail: &Value) -> (String, String, String) {
     let manifest = &detail["manifest"];
     let org = detail["org"].as_str().unwrap_or("").to_string();
@@ -6629,6 +6990,7 @@ fn spawn_app_cover(tx: Sender<Event>, ctx: egui::Context, url: String) {
     });
 }
 
+/// Decode cover bytes into a 256 px thumbnail texture (UI thread only).
 fn decode_cover(ctx: &egui::Context, url: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
     let image = image::load_from_memory(bytes).ok()?;
     let thumb = image
@@ -6639,6 +7001,18 @@ fn decode_cover(ctx: &egui::Context, url: &str, bytes: &[u8]) -> Option<egui::Te
     Some(ctx.load_texture(url.to_string(), pixels, egui::TextureOptions::LINEAR))
 }
 
+// ---------- applications: workers ----------
+//
+// App flows (all routed through flashserver `/v1/apps/...`):
+//   install:   confirm dialog → [run local script | download+run installer]
+//              → POST install → follow_app_job
+//   start:     [setup-script dialog] → POST start?async=1 → follow_app_job
+//   stop:      POST stop?async=1 → follow_app_job
+//   uninstall: DELETE /v1/apps/{org}/{name}[?purge_models=1]
+// Each flow ends with `Event::AppAction`, which refreshes list + detail.
+
+/// Fetch the app list for a search/domain filter; `req` lets the UI drop
+/// stale responses.
 fn spawn_apps(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -6737,6 +7111,7 @@ fn spawn_app_model_log(
     });
 }
 
+/// Fetch the full app detail (FlashHub manifest + local state).
 fn spawn_app_detail(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -6762,6 +7137,11 @@ fn spawn_app_detail(
     });
 }
 
+/// Run an app lifecycle action (`prepare` / `start` / `stop`).
+///
+/// start/stop are submitted as async daemon jobs and followed with
+/// `follow_app_job`; `start` also sends the approved setup scripts and the
+/// client home directory. A synchronous response is reported directly.
 fn spawn_app_action(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -6833,8 +7213,15 @@ fn spawn_app_action(
     });
 }
 
-/// `force` re-runs an already installed app; `run_script` records the user's
-/// explicit decision in the confirmation dialog.
+/// Install an application.
+///
+/// Step 1 (client OS, optional): run the platform install command or
+/// download and run the installer, streaming output into the job log.
+/// Step 2 (daemon): POST `/install` so flashserver prepares the models, then
+/// follow the returned job.
+///
+/// `force` re-runs an already installed app; whether step 1 ran is recorded
+/// via `app_install_body` (`client` vs `skip`).
 fn spawn_app_install(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -6905,6 +7292,10 @@ fn spawn_app_install(
 }
 
 /// Download an installer URL and run it, reporting progress into the job log.
+///
+/// The file goes to `%TEMP%/flashcli-apps/` via a `.part` file (renamed when
+/// complete) and is reused on a later attempt. `.exe` runs directly, `.msi`
+/// via `msiexec /i` (Windows only); `.dmg`/`.pkg` are opened with `open`.
 fn download_and_run_installer(
     tx: &Sender<Event>,
     ctx: &egui::Context,
@@ -7073,7 +7464,8 @@ fn download_and_run_installer(
     Ok(())
 }
 
-/// Shell that runs an install command on the client OS.
+/// Shell that runs an install command on the client OS (PowerShell on
+/// Windows, `sh -c` elsewhere).
 fn local_command(command: &str) -> (String, Vec<String>) {
     if cfg!(windows) {
         (
@@ -7092,6 +7484,7 @@ fn local_command(command: &str) -> (String, Vec<String>) {
 }
 
 /// Run the install command locally, streaming its output into the app job log.
+/// stdout and stderr are read on their own threads so neither pipe can block.
 fn run_local_command(
     tx: &Sender<Event>,
     ctx: &egui::Context,
@@ -7168,6 +7561,7 @@ fn run_local_command(
     }
 }
 
+/// Uninstall an app (optionally purging its models) via DELETE.
 fn spawn_app_uninstall(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -7202,6 +7596,9 @@ fn spawn_app_uninstall(
 /// Follow an install/prepare job over HTTP and stream its lines to the detail
 /// pane. WebSocket job events are not used for app jobs (they would also drive
 /// the model-loading progress bar).
+///
+/// Polls `/v1/jobs/{id}` every 400 ms, forwards only the events not seen yet,
+/// and finishes with `Event::AppAction` when the job is done or failed.
 fn follow_app_job(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -7270,6 +7667,7 @@ fn follow_app_job(
     });
 }
 
+/// Localized label of an app action.
 fn action_label(action: &str) -> &'static str {
     match action {
         "prepare" => "准备模型",
@@ -7279,6 +7677,9 @@ fn action_label(action: &str) -> &'static str {
     }
 }
 
+// ---------- models / hub / storage / logs workers ----------
+
+/// Search the FlashHub model catalog (proxied by flashserver `/v1/catalog`).
 fn spawn_catalog(tx: Sender<Event>, ctx: egui::Context, query: String, tag: Option<i64>) {
     std::thread::spawn(move || {
         let mut params = vec![
@@ -7314,6 +7715,7 @@ fn spawn_catalog(tx: Sender<Event>, ctx: egui::Context, query: String, tag: Opti
     });
 }
 
+/// Fetch the catalog tag filter list.
 fn spawn_catalog_tags(tx: Sender<Event>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let tags = get_json_timeout("/v1/catalog/tags", 20)
@@ -7336,6 +7738,7 @@ fn spawn_catalog_tags(tx: Sender<Event>, ctx: egui::Context) {
     });
 }
 
+/// Fetch the version list of one catalog repo.
 fn spawn_hub_detail(tx: Sender<Event>, ctx: egui::Context, id: i64) {
     std::thread::spawn(move || {
         match get_json_timeout(&format!("/v1/catalog/{id}"), 20) {
@@ -7355,6 +7758,8 @@ fn spawn_hub_detail(tx: Sender<Event>, ctx: egui::Context, id: i64) {
     });
 }
 
+/// Delete cached models (`/v1/models/clean`), summarize freed/skipped, then
+/// refresh the model list. Loaded/busy models are skipped by the daemon.
 fn spawn_clean(tx: Sender<Event>, ctx: egui::Context, refs: Vec<String>) {
     std::thread::spawn(move || {
         let body = serde_json::json!({ "refs": refs });
@@ -7394,6 +7799,7 @@ fn spawn_clean(tx: Sender<Event>, ctx: egui::Context, refs: Vec<String>) {
     });
 }
 
+/// Clean shared cache areas (`/v1/storage/clean`), then refresh storage.
 fn spawn_storage_clean(tx: Sender<Event>, ctx: egui::Context, targets: Vec<String>) {
     std::thread::spawn(move || {
         let body = serde_json::json!({ "targets": targets });
@@ -7412,6 +7818,8 @@ fn spawn_storage_clean(tx: Sender<Event>, ctx: egui::Context, targets: Vec<Strin
     });
 }
 
+/// Toggle the download mirror; retried up to 6 times, 2 s apart (the service
+/// may still be starting).
 fn spawn_set_mirror(tx: Sender<Event>, ctx: egui::Context, enabled: bool) {
     std::thread::spawn(move || {
         let body = serde_json::json!({ "enabled": enabled });
@@ -7443,6 +7851,7 @@ fn spawn_set_mirror(tx: Sender<Event>, ctx: egui::Context, enabled: bool) {
     });
 }
 
+/// Probe `/health` (2 s timeout).
 fn spawn_health(tx: Sender<Event>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let up = get_json_timeout("/health", 2).is_some();
@@ -7451,6 +7860,7 @@ fn spawn_health(tx: Sender<Event>, ctx: egui::Context) {
     });
 }
 
+/// Fetch `/v1/system` and `/v1/models` once (service just came back).
 fn spawn_system_refresh(tx: Sender<Event>, ctx: egui::Context) {
     std::thread::spawn(move || {
         if let Some(sys) = get_json("/v1/system") {
@@ -7463,6 +7873,7 @@ fn spawn_system_refresh(tx: Sender<Event>, ctx: egui::Context) {
     });
 }
 
+/// Stop a served model (`/v1/models/unload`).
 fn spawn_unload(tx: Sender<Event>, ctx: egui::Context, ref_str: String) {
     std::thread::spawn(move || {
         let body = serde_json::json!({ "ref": ref_str });
@@ -7475,6 +7886,8 @@ fn spawn_unload(tx: Sender<Event>, ctx: egui::Context, ref_str: String) {
     });
 }
 
+/// Fetch the last 300 log lines: a model's serve log when `model_ref` is set,
+/// otherwise the service log (optionally `since` an epoch).
 fn spawn_logs(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -7509,6 +7922,7 @@ fn spawn_logs(
     });
 }
 
+/// Stream the full log (`/v1/logs/download`) into a user-chosen file.
 fn spawn_export_logs(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -7548,13 +7962,17 @@ fn now_epoch() -> u64 {
 }
 
 // ---------- HTTP / service ----------
+// Blocking ureq helpers (call only from worker threads). GET helpers return
+// None on any failure; write helpers return the daemon's `error` text.
 
+/// Agent with a short 3 s timeout for quick status reads.
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(3))
         .build()
 }
 
+/// GET `api_base() + path` as JSON (3 s timeout).
 fn get_json(path: &str) -> Option<Value> {
     agent()
         .get(&format!("{}{}", api_base(), path))
@@ -7564,6 +7982,7 @@ fn get_json(path: &str) -> Option<Value> {
         .ok()
 }
 
+/// GET with URL-encoded query parameters (20 s timeout).
 fn get_json_query(path: &str, params: &[(&str, String)]) -> Option<Value> {
     let mut request = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(20))
@@ -7575,6 +7994,7 @@ fn get_json_query(path: &str, params: &[(&str, String)]) -> Option<Value> {
     request.call().ok()?.into_json().ok()
 }
 
+/// GET with a custom timeout.
 fn get_json_timeout(path: &str, secs: u64) -> Option<Value> {
     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(secs))
@@ -7586,10 +8006,12 @@ fn get_json_timeout(path: &str, secs: u64) -> Option<Value> {
         .ok()
 }
 
+/// POST JSON with the default 60 s timeout.
 fn post_json(path: &str, body: &Value) -> Result<Value, String> {
     post_json_timeout(path, body, 60)
 }
 
+/// PUT JSON with a custom timeout.
 fn put_json_timeout(path: &str, body: &Value, secs: u64) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(secs))
@@ -7604,6 +8026,7 @@ fn put_json_timeout(path: &str, body: &Value, secs: u64) -> Result<Value, String
     }
 }
 
+/// POST JSON with a custom timeout.
 fn post_json_timeout(path: &str, body: &Value, secs: u64) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(secs))
@@ -7618,7 +8041,7 @@ fn post_json_timeout(path: &str, body: &Value, secs: u64) -> Result<Value, Strin
     }
 }
 
-// Prefer the daemon's JSON `error` text over the raw body in toasts.
+/// Prefer the daemon's JSON `error` text over the raw body in toasts.
 fn http_error_message(resp: ureq::Response) -> String {
     let text = resp.into_string().unwrap_or_default();
     if let Ok(v) = serde_json::from_str::<Value>(&text) {
@@ -7633,6 +8056,7 @@ fn http_error_message(resp: ureq::Response) -> String {
     }
 }
 
+/// DELETE (60 s timeout).
 fn delete_json(path: &str) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(60))
@@ -7644,6 +8068,7 @@ fn delete_json(path: &str) -> Result<Value, String> {
     }
 }
 
+/// Load the serve options of one model for the options dialog.
 fn spawn_model_options(tx: Sender<Event>, ctx: egui::Context, reference: String) {    std::thread::spawn(move || {
         let result = get_json_query("/v1/models/options", &[("ref", reference.clone())])
             .ok_or_else(|| "读取启动参数失败：服务不可用".to_string());
@@ -7652,6 +8077,7 @@ fn spawn_model_options(tx: Sender<Event>, ctx: egui::Context, reference: String)
     });
 }
 
+/// Save host/port/options for a model (`PUT /v1/models/options`).
 fn spawn_save_model_options(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -7674,6 +8100,7 @@ fn spawn_save_model_options(
     });
 }
 
+/// Fire-and-forget cancel of a daemon job.
 fn spawn_cancel_job(ctx: egui::Context, job_id: String) {
     std::thread::spawn(move || {
         let _ = post_json_timeout(
@@ -7685,6 +8112,7 @@ fn spawn_cancel_job(ctx: egui::Context, job_id: String) {
     });
 }
 
+/// Submit a smoke test job; its progress arrives as `smoke` WebSocket jobs.
 fn spawn_smoke(tx: Sender<Event>, ctx: egui::Context, ref_str: String) {
     std::thread::spawn(move || {
         let body = serde_json::json!({ "ref": ref_str });
@@ -7708,6 +8136,13 @@ fn spawn_smoke(tx: Sender<Event>, ctx: egui::Context, ref_str: String) {
     });
 }
 
+// ---------- WSL / service control ----------
+// On Windows flashserver runs as a systemd unit inside a WSL distro, so the
+// client drives it with `wsl.exe -d <distro> -u root -- ...`. On other
+// platforms the same helpers run the commands directly on the host.
+
+/// WSL distro chosen by the installer (`state_dir()/distro.txt`), default
+/// `Ubuntu`.
 #[cfg(windows)]
 fn wsl_distro() -> String {
     if let Some(path) = state_dir().map(|dir| dir.join("distro.txt")) {
@@ -7721,6 +8156,7 @@ fn wsl_distro() -> String {
     "Ubuntu".to_string()
 }
 
+/// Run a command as root inside the distro; Err carries stderr.
 fn run_wsl(args: &[&str]) -> Result<(), String> {
     let distro = wsl_distro();
     let mut cmd = std::process::Command::new("wsl.exe");
@@ -7734,6 +8170,8 @@ fn run_wsl(args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Background `sleep infinity` in the distro: WSL's idle timeout would
+/// otherwise stop the distro (and flashserver) when no process is attached.
 #[cfg(windows)]
 fn spawn_keepalive() {
     let distro = wsl_distro();
@@ -7743,12 +8181,14 @@ fn spawn_keepalive() {
     let _ = cmd.spawn();
 }
 
+/// Suppress the console window of a child process (CREATE_NO_WINDOW).
 #[cfg(windows)]
 fn hide(cmd: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     cmd.creation_flags(0x08000000);
 }
 
+/// Non-Windows: run the command directly on the host.
 #[cfg(not(windows))]
 fn run_wsl(args: &[&str]) -> Result<(), String> {
     let (program, rest) = args
@@ -7768,6 +8208,9 @@ fn run_wsl(args: &[&str]) -> Result<(), String> {
 #[cfg(not(windows))]
 fn spawn_keepalive() {}
 
+/// Start flashserver: boot the distro, wait for systemd, `systemctl start
+/// flashserver` (with retries), start the keepalive, then wait up to 8 s for
+/// the API `/health`.
 fn start_service() -> Result<String, String> {
     // 1) Bring the distro up. `wsl --terminate` leaves it stopped; this call
     // starts it and waits for init. Retry because WSL can still be shutting
@@ -7838,6 +8281,7 @@ fn start_service() -> Result<String, String> {
     Err("FlashServer 已启动，但 API 不可达；请检查 WSL 网络/端口或运行 flashserver-setup --start-service".into())
 }
 
+/// Stop flashserver and the keepalive; optionally terminate the distro too.
 fn stop_service(stop_wsl: bool) -> Result<String, String> {
     run_wsl(&["systemctl", "stop", "flashserver"])?;
     let _ = run_wsl(&["pkill", "-f", "sleep infinity"]);
@@ -7852,6 +8296,9 @@ fn stop_service(stop_wsl: bool) -> Result<String, String> {
     }
 }
 
+/// Enable/disable start-at-logon. Windows: run `flashserver-setup.exe
+/// --enable-autostart|--disable-autostart` elevated (UAC) through PowerShell.
+/// Elsewhere: `systemctl enable|disable flashserver`.
 fn set_autostart(enabled: bool) -> Result<String, String> {
     #[cfg(windows)]
     {
@@ -7901,6 +8348,8 @@ fn set_autostart(enabled: bool) -> Result<String, String> {
     }
 }
 
+/// Locate `flashserver-setup.exe`: `FLASHSERVER_SETUP_BIN`, else the
+/// installer's `payload/` next to (or one level above) this executable.
 fn setup_bin() -> Option<String> {
     if let Ok(v) = std::env::var("FLASHSERVER_SETUP_BIN") {
         if !v.is_empty() {
@@ -7923,6 +8372,7 @@ fn setup_bin() -> Option<String> {
 
 // ---------- WSL config / startup options ----------
 
+/// JSON value as display text (strings unquoted, null as empty).
 fn json_text(v: &Value) -> String {
     if v.is_null() {
         String::new()
@@ -7933,6 +8383,7 @@ fn json_text(v: &Value) -> String {
     }
 }
 
+/// `%USERPROFILE%/.wslconfig` (or `$HOME/.wslconfig`).
 fn wslconfig_path() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("USERPROFILE") {
         return Some(PathBuf::from(home).join(".wslconfig"));
@@ -7940,6 +8391,7 @@ fn wslconfig_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".wslconfig"))
 }
 
+/// Read the managed keys from `.wslconfig` (defaults when missing).
 fn load_wslconfig() -> WslConfig {
     wslconfig_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -7947,6 +8399,7 @@ fn load_wslconfig() -> WslConfig {
         .unwrap_or_default()
 }
 
+/// Parse the managed keys from the `[wsl2]` section (case-insensitive).
 fn parse_wslconfig(text: &str) -> WslConfig {
     let mut cfg = WslConfig::default();
     let mut in_wsl2 = false;
@@ -7977,6 +8430,7 @@ fn parse_wslconfig(text: &str) -> WslConfig {
     cfg
 }
 
+/// Size like `16GB` / `512MB` / plain bytes; empty is valid (unset).
 fn valid_wsl_size(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() {
@@ -7993,6 +8447,7 @@ fn valid_wsl_size(value: &str) -> bool {
     matches!(unit.as_str(), "" | "B" | "KB" | "MB" | "GB" | "TB")
 }
 
+/// CPU count 1..=256; empty is valid (unset).
 fn valid_processors(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() {
@@ -8004,6 +8459,7 @@ fn valid_processors(value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Comma-separated ports or `a-b` ranges (1..=65535); empty = any port.
 fn valid_firewall_ports(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() {
@@ -8028,6 +8484,9 @@ fn valid_firewall_ports(value: &str) -> bool {
     true
 }
 
+/// Rewrite `.wslconfig` text: drop the managed keys from `[wsl2]` and insert
+/// the new values right after its header (appending a `[wsl2]` section if
+/// missing). Other sections/keys, comments and the line ending are kept.
 fn update_wslconfig(text: &str, cfg: &WslConfig) -> String {
     let sep = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut managed = Vec::new();
@@ -8094,6 +8553,7 @@ fn update_wslconfig(text: &str, cfg: &WslConfig) -> String {
     result
 }
 
+/// Merge `cfg` into `.wslconfig` on disk.
 fn save_wslconfig(cfg: &WslConfig) -> Result<(), String> {
     let path = wslconfig_path().ok_or_else(|| "找不到 USERPROFILE，无法写入 .wslconfig".to_string())?;
     let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -8101,6 +8561,8 @@ fn save_wslconfig(cfg: &WslConfig) -> Result<(), String> {
     std::fs::write(&path, updated).map_err(|e| format!("写入 {} 失败：{e}", path.display()))
 }
 
+/// Write a PowerShell script to %TEMP% and run it elevated (UAC prompt),
+/// waiting for it to finish. Used for the firewall rule.
 fn run_elevated_ps1(script: &str) -> Result<(), String> {
     let path = std::env::temp_dir().join("flashserver-wsl-firewall.ps1");
     std::fs::write(&path, script).map_err(|e| e.to_string())?;
@@ -8131,10 +8593,12 @@ fn hidden_command(program: &str) -> std::process::Command {
     cmd
 }
 
+/// flashserver answers `/health` (2 s timeout).
 fn api_healthy() -> bool {
     get_json_timeout("/health", 2).is_some()
 }
 
+/// systemd reports the flashserver unit `active` inside the distro.
 fn service_active() -> bool {
     let distro = wsl_distro();
     hidden_command("wsl.exe")
@@ -8144,6 +8608,13 @@ fn service_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Apply WSL settings:
+/// 1. save `.wslconfig` and `wsl --shutdown` (settings load on next boot);
+/// 2. optionally restart flashserver;
+/// 3. mirrored networking: if the API stays unreachable while the unit is
+///    active, roll back to NAT automatically and report an error;
+/// 4. mirrored networking: (re)create the "FlashServer models" inbound
+///    firewall rule for the chosen ports (elevated; failure is a warning).
 fn apply_wsl(cfg: &WslConfig, restart_service: bool, ports: &str) -> Result<String, String> {
     let distro = wsl_distro();
     save_wslconfig(cfg)?;
@@ -8221,6 +8692,7 @@ New-NetFirewallRule -DisplayName 'FlashServer models' -Direction Inbound -Action
     }
 }
 
+/// Run `apply_wsl` in the background and report `Event::WslApplied`.
 fn spawn_apply_wsl(
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -8237,10 +8709,13 @@ fn spawn_apply_wsl(
 
 // ---------- settings / fonts / theme ----------
 
+/// `state_dir()/settings.json`.
 fn settings_path() -> Option<PathBuf> {
     Some(state_dir()?.join("settings.json"))
 }
 
+/// Load settings (tolerates a UTF-8 BOM written by Windows tools); defaults
+/// to the dark theme.
 fn load_settings() -> Settings {
     settings_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -8248,6 +8723,7 @@ fn load_settings() -> Settings {
         .unwrap_or(Settings { dark: true, wsl_ports: String::new(), stop_wsl: false })
 }
 
+/// Persist settings (best effort; errors are ignored).
 fn save_settings(s: &Settings) {
     if let Some(path) = settings_path() {
         if let Some(dir) = path.parent() {
@@ -8259,6 +8735,7 @@ fn save_settings(s: &Settings) {
     }
 }
 
+/// Apply the custom dark/light palette, widget styling and text sizes.
 fn apply_theme(ctx: &egui::Context, dark: bool) {
     // Pin the preference so egui never falls back to the OS theme; the custom
     // visuals below must be written to the theme that is actually active.
@@ -8356,6 +8833,8 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     ctx.set_visuals_of(theme, visuals);
 }
 
+/// Add the first available system CJK font (Microsoft YaHei, PingFang, Noto
+/// CJK) as a fallback so Chinese text renders; egui's default fonts lack CJK.
 fn install_fonts(ctx: &egui::Context) {
     let candidates = [
         r"C:\Windows\Fonts\msyh.ttc",
@@ -8385,6 +8864,7 @@ fn install_fonts(ctx: &egui::Context) {
 
 // ---------- format ----------
 
+/// Human-readable binary size (`1.5 GiB`).
 fn fmt_bytes(n: f64) -> String {
     let units = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = n;
@@ -8400,6 +8880,7 @@ fn fmt_bytes(n: f64) -> String {
     }
 }
 
+/// Compact uptime (`2d 3h`, `4h 5m`, `6m 7s`).
 fn fmt_uptime(sec: f64) -> String {
     let sec = sec.max(0.0) as u64;
     let d = sec / 86400;
@@ -8422,6 +8903,7 @@ fn autostart_text(state: Option<bool>) -> &'static str {
     }
 }
 
+/// Localized daemon job phase for the progress card.
 fn translate_phase(phase: &str) -> &str {
     match phase {
         "prepare" => "准备 Bundle",
@@ -8437,6 +8919,7 @@ fn translate_phase(phase: &str) -> &str {
     }
 }
 
+/// Last `NN%` / `NN.N%` token in a progress message, clamped to 0..=100.
 fn parse_pct(message: &str) -> Option<f32> {
     let mut found = None;
     for token in message.split_whitespace() {
@@ -8454,6 +8937,9 @@ fn parse_pct(message: &str) -> Option<f32> {
     found
 }
 
+/// Entry point: build the native window (embedded icon, 1180×760 initial,
+/// 900×600 minimum) and run the eframe event loop with `App` until the window
+/// closes. A failed icon decode only skips the icon.
 fn main() -> eframe::Result<()> {
     let icon = image::load_from_memory(include_bytes!("../ui/icon.png"))
         .ok()
